@@ -9,7 +9,9 @@
 #ifndef DEBUGUTILS_H
 #define DEBUGUTILS_H
 
-#if (DEBUG)
+#include "macros.h"
+
+#if USING(SERIAL_DEBUG)
   #define DPRINT(...) Serial.print(__VA_ARGS__)
   #define DPRINTLN(...) Serial.println(__VA_ARGS__)
   #define DBEGIN(...) Serial.begin(__VA_ARGS__)

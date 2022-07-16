@@ -22,14 +22,6 @@ void safedelay(unsigned int delay_time) {
 }
 
 
-#ifdef ESP8266
-uint32_t RTCmillis() {
-  // system_get_rtc_time() is in us (but very inaccurate anyway)
-  return (system_get_rtc_time() * (system_rtc_clock_cali_proc() >> 12)) / 1000;
-}
-#endif
-
-
 /*
  * Converts an IPAddress type to a string
  */
@@ -86,6 +78,12 @@ String getReadableTime(unsigned long millis) {
   return readableTime;
 }
 
+#if defined(ESP8266)
+uint32_t RTCmillis() {
+  // system_get_rtc_time() is in us (but very inaccurate anyway)
+  return (system_get_rtc_time() * (system_rtc_clock_cali_proc() >> 12)) / 1000;
+}
+
 // Write 16 bit int to RTC memory with checksum, return true if verified OK
 // Slot 0-127
 // (C) Turo Heikkinen 2019 , Source: https://hackaday.io/project/24993/instructions
@@ -113,6 +111,7 @@ bool readRtcMem(uint16_t *inVal, uint8_t slot = 0) {
   }
   return false;
 }
+#endif
 
 /*
 This short article presents trivial but fast and memory efficient function to compare two strings. 

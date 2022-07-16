@@ -1,8 +1,8 @@
 
 /*
- * Sketch for a door sensor. The door sensor power is controlled by a ATTiny to take advantage of the ultra low sleep current of a ATTiny. 
+ * Sketch for a contact sensor. The contact sensor power is controlled by a ATTiny to take advantage of the ultra low sleep current of a ATTiny. 
  * This ESP when it receives power, holds it power by setting CH_HOLD pin to HIGH 
- * It then reads the sensor value of the door contact and sends that to a ESP gateway via espnow
+ * It then reads the sensor value of the contact contact and sends that to a ESP gateway via espnow
  * It then powers itself off by pulling down the CH_HOLD pin.
  * espnow takes ~ 2 sec to obtain the current channel of the SSID, so I store the same in the EEPROM memory and read it every time, saves a lot of time
  * As it rarely changes, the EEPROM isnt worn out. 
@@ -21,20 +21,20 @@
 #pragma message STR(DEVICE)
 #endif
 */
-// This is how you assign a numeric value to a #define constant
-#define DEBUG (0) //can be either 0 or 1 , BEAWARE that this statement should be before #include "Debugutils.h" else the macros wont work as they are based on this #define
 
 #include <Arduino.h>
-#include "Debugutils.h" //This file is located in the Sketches\libraries\DebugUtils folder
+#include "macros.h"
+#include "secrets.h"
+#include "Config.h"
+#include "Debugutils.h"
 #include <ESP8266WiFi.h>
 #include <espnow.h>
-#include "secrets.h"
 #include "espnowMessage.h" // for struct of espnow message
-#include "Config.h"
 #include "myutils.h" //include utility functions
-#include "espnowUtil.h" //defines all utility functions for espnow functionality
-#include <ESP_EEPROM.h> // to store espnow wifi channel no in eeprom for retrival later
+#include "espnowController.h" //defines all utility functions for espnow functionality
+#include <EEPROM.h> // to store espnow wifi channel no in eeprom for retrival later
 
+// ************ HASH DEFINES *******************
 #define VERSION "2.3"
 //Types of messages decoded via the signal pins
 #define SENSOR_NONE 0
@@ -42,23 +42,27 @@
 #define SENSOR_CLOSE 2
 #define MSG_ON 1 //payload for ON
 #define MSG_OFF 0//payload for OFF
+// ************ HASH DEFINES *******************
 
+// ************ GLOBAL OBJECTS/VARIABLES *******************
 short CURR_MSG = SENSOR_NONE;//This stores the message type deciphered from the states of the signal pins
-
 ADC_MODE(ADC_VCC);//connects the internal ADC to VCC pin and enables measuring Vcc
 const char compile_version[] = VERSION " " __DATE__ " " __TIME__; //note, the 3 strings adjacent to each other become pasted together as one long string
-
 espnow_message myData;
+#if USING(SECURITY)
+uint8_t kok[16]= PMK_KEY_STR;//comes from secrets.h
+uint8_t key[16] = LMK_KEY_STR;// comes from secrets.h
+#endif
+// ************ GLOBAL OBJECTS/VARIABLES *******************
 
 /*
  * Callback when data is sent , It sets the bResultReady flag to true on successful delivery of message
  * The flag is set to false in the main loop where data is sent and then the code waits to see if it gets set to true, if not it retires to send
  */
 esp_now_send_cb_t OnDataSent([](uint8_t *mac_addr, uint8_t status) {
-  bResult = (status == 0? true:false);
-//  bResult = status;
-  DPRINT("Last Packet Send Status:");
-  DPRINTLN(status == 0 ? "Delivery Success" : "Delivery Fail");
+  deliverySuccess = status;
+  DPRINT("OnDataSent:Last Packet delivery status:\t");
+  DPRINTLN(status == 0 ? "Success" : "Fail");
   bResultReady = true;
 });
 
@@ -77,8 +81,11 @@ void setup() {
   DPRINTLN("HOLD HIGH START");
   pinMode(HOLD_PIN, FUNCTION_3);//Because we're using Rx & Tx as inputs here, we have to set the input type     
   pinMode(HOLD_PIN, OUTPUT);
-  digitalWrite(HOLD_PIN, LOW);  // sets HOLD_PIN to high (this holds CH_PD high even if the input signal goes LOW)
-  
+  if(HOLDING_LOGIC == LOGIC_NORMAL)
+    digitalWrite(HOLD_PIN, HIGH);  // sets HOLD_PIN to high
+  else // LOGIC_INVERTED
+    digitalWrite(HOLD_PIN, LOW);  // sets HOLD_PIN to high
+
   //Initialize EEPROM , this is used to store the channel no for espnow in the memory, only stored when it changes which is rare
   EEPROM.begin(16);// 16 is the size of the EEPROM to be allocated, 16 is the minimum
   // For us to use Rx as input we have to define the pins as below else it would continue to be Serial pins
@@ -91,6 +98,12 @@ void setup() {
   //Init Serial Monitor
   DPRINTLN("Starting up");
 
+  // The following code is to wait for some time before reading the value of the SIGNAL_PIN for a bouncy contact sensor
+  // The one which bounces a few times before settling in on the final value
+  #ifdef BOUNCE_DELAY
+    safedelay(BOUNCE_DELAY*1000);
+  #endif
+
   //Read the value of the sensor on the input pins asap , ATtiny can then remove the signal and the ESP wont care
   if(digitalRead(SIGNAL_PIN) == HIGH)
     CURR_MSG = SENSOR_OPEN;
@@ -100,23 +113,26 @@ void setup() {
   DPRINTLN(digitalRead(SIGNAL_PIN));
 
   DPRINTLN("initializing espnow");
-  Initilize_espnow();
+  initilizeESP(WIFI_SSID,MY_ROLE);
 
   // register callbacks for events when data is sent and data is received
   esp_now_register_send_cb(OnDataSent);
   esp_now_register_recv_cb(OnDataRecv);
+  #if USING(SECURITY)
+    refreshPeer(gatewayAddress,key,RECEIVER_ROLE);
+  #else
+    refreshPeer(gatewayAddress,NULL,RECEIVER_ROLE);
+  #endif
 
-  refreshPeer();
-
-  // char device_id[13];
-  // String wifiMacString = WiFi.macAddress();
-  // wifiMacString.replace(":","");
-  // snprintf(device_id, 13, "%s", wifiMacString.c_str());
-  // strcpy(device_id,wifiMacString.c_str());
-  // DPRINTF("deviceid:%s\n",device_id);
-  
   // populate the values for the message
-  strcpy(myData.device_name,DEVICE_NAME);
+  // If devicename is not given then generate one from MAC address stripping off the colon
+  #ifndef DEVICE_NAME
+    String wifiMacString = WiFi.macAddress();
+    wifiMacString.replace(":","");
+    snprintf(myData.device_name, 16, "%s", wifiMacString.c_str());
+  #else
+    strcpy(myData.device_name,DEVICE_NAME);
+  #endif
   myData.intvalue1 = (CURR_MSG == SENSOR_OPEN? MSG_ON:MSG_OFF);
   DPRINTLN(myData.intvalue1);
   myData.intvalue2 = ESP.getVcc();
@@ -132,12 +148,19 @@ void setup() {
   // and that for a ESP is always constant. Hence I am trying to get a combination of the following 4 things, micros creates an almost true random number
   myData.message_id = myData.intvalue1 + myData.intvalue2 + WiFi.RSSI() + micros();
   myData.intvalue3 = millis();// for debug purpuses, send the millis till this instant in intvalue3
-  send_espnow_message(&myData);
+  int result = sendESPnowMessage(&myData,gatewayAddress);
+  if (result == 0) {
+    DPRINTLN("Delivered with success");}
+  else {DPRINTFLN("Error sending/receipting the message, error code:%d",result);}
 
   // Now you can kill power
   DPRINTLN("powering down");
   DFLUSH();
-  digitalWrite(HOLD_PIN, HIGH);  // send a HIGH to cut power to the ESP
+  if(HOLDING_LOGIC == LOGIC_NORMAL)
+    digitalWrite(HOLD_PIN, LOW);  // cut power to the ESP
+  else // LOGIC_INVERTED
+    digitalWrite(HOLD_PIN, HIGH);  // cut power to the ESP
+
 }
 
 

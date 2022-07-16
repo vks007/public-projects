@@ -22,13 +22,9 @@
  */
 
 // IMPORTANT : Compile it for the device you want, details of which are in Config.h
+// Define macros for turning features ON and OFF , usage : #define SECURITY IN_USE
 
-#define IN_USE == 1
-#define NOT_IN_USE == 0
-#define USING(feature) 1 feature //macro to check a feature , ref : https://stackoverflow.com/questions/18348625/c-macro-to-enable-and-disable-code-features
-
-//Turn features ON and OFF below
-#define SECURITY NOT_IN_USE
+//#define DEBUG (1) //BEAWARE that this statement should be before #include "Debugutils.h" else the macros wont work as they are based on this #define
 /* For now currently turning OFF security as I am not able to make it work. It works even if the keys aren't the same on controller and slave
  * Also I have to find a way to create a list of multiple controllers as with security you haev to register each controller separately
  * See ref code here: https://www.electrosoftcloud.com/en/security-on-your-esp32-with-esp-now/
@@ -36,47 +32,54 @@
 
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
-#include <espnow.h>
 #include "Config.h"
+#include "Debugutils.h" //This file is located in the Sketches\libraries\DebugUtils folder
+#include <espnow.h>
 #include "secrets.h"
 #include <ArduinoJson.h>
 #include <ArduinoQueue.h>
 #include <ArduinoOTA.h>
 #include "espnowMessage.h" // for struct of espnow message
-#include "myutils.h"
 #include <PubSubClient.h>
 #include <Pinger.h>
+#include "myutils.h"
+#include "espwatchdog.h"
+#include "pir_sensor.h"
+#include <ezLED.h> // I am using a local copy of this library instead from the std library repo as that has an error in cpp file.
+// The author has defined all functions which take a default argumnent again in the cpp file whereas the default argument should only be 
+// specified in the decleration and not in the implementation of the function.
 
 
-#define DEBUG (1) //BEAWARE that this statement should be before #include "Debugutils.h" else the macros wont work as they are based on this #define
-
-#include "Debugutils.h" //This file is located in the Sketches\libraries\DebugUtils folder
 #define VERSION "1.2"
 const char compile_version[] = VERSION " " __DATE__ " " __TIME__; //note, the 3 strings adjacent to each other become pasted together as one long string
+#define KEY_LEN  16 // lenght of PMK & LMK key (fixed at 16 for ESP)
 #define MQTT_RETRY_INTERVAL 5000 //MQTT server connection retry interval in milliseconds
 #define QUEUE_LENGTH 50
 #define MAX_MESSAGE_LEN 251 // defnies max message length, as the max espnow allows is 250, cant exceed it
 #define ESP_OK 0 // This is defined for ESP32 but not for ESP8266 , so define it
 #define HEALTH_INTERVAL 30e3 // interval is millisecs to publish health message for the gateway
+// API_TIMEOUT is used to determine how long to wait for MQTT connection before restarting the ESP
+#ifndef API_TIMEOUT
+  #define API_TIMEOUT 600 // define default timeout of monitoring for MQTT connection if not defined.
+#endif
 const char* ssid = WiFi_SSID;
 const char* password = WiFi_SSID_PSWD;
 long last_time = 0;
 bool retry_message = false;
 long last_message_count = 0;//stores the last count with which message rate was calculated
 long message_count = 0;//keeps track of total no of messages publshed since uptime
-long lastReconnectAttempt = 0;
-bool last_msg_publish = false;
+long lastReconnectAttempt = 0; // Keeps track of the last time an attempt was made to connect to MQTT
+bool initilised = false; // flag to track if initialisation of the ESP has finished. At present it only handles tracking of the "init" message published on startup
 String strIP_address = "";//stores the IP address of the ESP
-bool startup = true; //flag to indicate startup, is set to false at the end of setup()
 
-#define MY_ROLE         ESP_NOW_ROLE_COMBO              // set the role of this device: CONTROLLER, SLAVE, COMBO
-#define RECEIVER_ROLE   ESP_NOW_ROLE_COMBO              // set the role of the receiver
 extern "C"
 {
   #include <lwip/icmp.h> // needed for icmp packet definitions
 }
 // Set global to avoid object removing after setup() routine
 Pinger pinger;
+ezLED  statusLED(STATUS_LED);
+watchDog MQTT_wd = watchDog(API_TIMEOUT); // monitors the MQTT connection, if it is disconnected beyond API_TIMEOUT , it restarts ESP
 
 //List of controllers(sensors) who will send messages to this receiver
 uint8_t controller_mac[][6] = CONTROLLERS; //from secrets.h
@@ -86,13 +89,8 @@ uint8_t controller_mac[][6] = CONTROLLERS; //from secrets.h
 //    {0xC, 0xDD, 0xC2, 0x33, 0x11, 0x98}
 // };
 
-#if USING(SECURITY)
-uint8_t kok[16]= PMK_KEY_STR;//comes from secrets.h
-uint8_t key[16] = LMK_KEY_STR;// comes from secrets.h
-#else
-uint8_t kok[16]= {};//comes from secrets.h
-uint8_t key[16] = {};// comes from secrets.h
-#endif
+uint8_t kok[KEY_LEN]= PMK_KEY_STR;//comes from secrets.h
+uint8_t key[KEY_LEN] = LMK_KEY_STR;// comes from secrets.h
 
 ArduinoQueue<espnow_message> structQueue(QUEUE_LENGTH);
 WiFiClient espClient;
@@ -100,36 +98,63 @@ PubSubClient client(espClient);
 static espnow_message emptyMessage;
 espnow_message currentMessage = emptyMessage;
 
+#if USING(MOTION_SENSOR)
+pir_sensor motion_sensor(PIR_PIN,MOTION_ON_DURATION);
+#endif
+
+typedef enum
+{
+  MOTION = 0,
+  UNDEFINED = 1
+}msgType;
+
 /*
  * connects to MQTT server , publishes LWT message as "online" every time it connects
+ * waits for a time defined by MQTT_RETRY_INTERVAL before reconnecting again
+ * I had issues with MQTT nto able to connect at times and so I included pinger to ping the gateway but then the issue hasnt happened for a long time now
  */
 bool reconnectMQTT()
 {
-  DPRINT("Attempting MQTT connection...");
-  // publishes the LWT message ("online") to the topic,If the this device disconnects from the broker ungracefully then the broker automatically posts the "offline" message on the LWT topic
-  // so that all connected clients know that this device has gone offline
-  char publish_topic[65] = ""; //variable accomodates 50 characters of main topic + 15 char of sub topic
-  strcpy(publish_topic,MQTT_TOPIC);
-  strcat(publish_topic,"/LWT"); 
-  if (client.connect(DEVICE_NAME,mqtt_uname,mqtt_pswd,publish_topic,0,true,"offline")) {//credentials come from secrets.h
-    DPRINTLN("connected");
-    client.publish(publish_topic,"online",true);
-    return true;
-  }
-  else 
+  if (!client.connected())
   {
-    DPRINT("failed, rc=");
-    DPRINT(client.state());
-    if(pinger.Ping(WiFi.gatewayIP()))
+    long now = millis();
+    if ((now - lastReconnectAttempt > MQTT_RETRY_INTERVAL) || lastReconnectAttempt == 0) 
     {
-      DPRINT("ping to gateway success");
+      lastReconnectAttempt = now;
+      DPRINTLN("Attempting MQTT connection...");
+      // publishes the LWT message ("online") to the topic,If the this device disconnects from the broker ungracefully then the broker automatically posts the "offline" message on the LWT topic
+      // so that all connected clients know that this device has gone offline
+      char publish_topic[65] = ""; //variable accomodates 50 characters of main topic + 15 char of sub topic
+      strcpy(publish_topic,MQTT_TOPIC);
+      strcat(publish_topic,"/LWT"); 
+      if (client.connect(DEVICE_NAME,mqtt_uname,mqtt_pswd,publish_topic,0,true,"offline")) {//credentials come from secrets.h
+        DPRINTLN("MQTT connected");
+        client.publish(publish_topic,"online",true);
+        if(statusLED.getState() == LED_BLINKING)
+          statusLED.cancel();
+        return true;
+      }
+    //   else 
+    //   {
+    //     DPRINT("failed, rc=");
+    //     DPRINT(client.state());
+    //     if(pinger.Ping(WiFi.gatewayIP()))
+    //     {
+    //       DPRINTLN("ping to gateway success");
+    //     }
+    //     else
+    //     {
+    //       DPRINTLN("ping to gateway failed");
+    //     }
+    //   }
     }
-    else
-    {
-      DPRINT("ping to gateway failed");
-    }
+    if(statusLED.getState() == LED_IDLE)
+      statusLED.blink(1000, 500);
+    return false;
   }
-  return false;
+  if(statusLED.getState() == LED_BLINKING)
+    statusLED.cancel();
+  return true;
 }
 
 /*
@@ -141,7 +166,7 @@ bool publishToMQTT(const char msg[],const char topic[], bool retain)
   {
     if(client.publish(topic,msg,retain))
     {
-      DPRINT("publishToMQTT-Success:");DPRINTLN(msg);
+      DPRINT("publishToMQTT-Published:");DPRINTLN(msg);
       return true;
     }
     else
@@ -149,6 +174,7 @@ bool publishToMQTT(const char msg[],const char topic[], bool retain)
       DPRINT("publishToMQTT-Failed:");DPRINTLN(msg);
     }
   }
+  DPRINTLN("Publish failed - MQTT not connected");
   return false;
 }
 
@@ -186,7 +212,21 @@ bool publishToMQTT(espnow_message msg) {
   String str_msg="";
   serializeJson(msg_json,str_msg);
   return publishToMQTT(str_msg.c_str(),final_publish_topic,false);
-  //Serial.printf("published message with len:%u\n",measureJson(msg_json));
+  //DPRINTF("published message with len:%u\n",measureJson(msg_json));
+}
+
+/*
+ * Creates a message string for motion ON message and publishes it to a MQTT queue
+ * Returns true if message was published successfully else false
+ */
+bool publishMotionMsgToMQTT(const char topic_name[],const char state[4]) {
+  char publish_topic[65] = "";
+  // create a path for this specific device which is of the form MQTT_BASE_TOPIC/<master_id> , master_id is usually the mac address stripped off the colon eg. MQTT_BASE_TOPIC/2CF43220842D
+  strcpy(publish_topic,MQTT_TOPIC);
+  strcat(publish_topic,"/");
+  strcat(publish_topic,topic_name);
+  strcat(publish_topic,"/state");
+  return publishToMQTT(state,publish_topic,false);
 }
 
 /*
@@ -206,7 +246,7 @@ void OnDataSent(uint8_t *receiver_mac, uint8_t transmissionStatus) {
 void OnDataRecv(uint8_t * mac, uint8_t *incomingData, uint8_t len) {
   espnow_message msg;
   memcpy(&msg, incomingData, sizeof(msg));
-  //DPRINTF("OnDataRecv:%lu,%d,%d,%d,%d,%f,%f,%f,%f,%s,%s\n",msg.message_id,msg.intvalue1,msg.intvalue2,msg.intvalue3,msg.intvalue4,msg.floatvalue1,msg.floatvalue2,msg.floatvalue3,msg.floatvalue4,msg.chardata1,msg.chardata2);
+  DPRINTF("OnDataRecv:%lu,%d,%d,%d,%d,%f,%f,%f,%f,%s,%s\n",msg.message_id,msg.intvalue1,msg.intvalue2,msg.intvalue3,msg.intvalue4,msg.floatvalue1,msg.floatvalue2,msg.floatvalue3,msg.floatvalue4,msg.chardata1,msg.chardata2);
   
     if(!structQueue.isFull())
       structQueue.enqueue(msg);
@@ -216,53 +256,73 @@ void OnDataRecv(uint8_t * mac, uint8_t *incomingData, uint8_t len) {
 
 /*
  * creates data for health message and publishes it
+ * takes bool param init , if true then publishes the startup message else publishes the health check message
  */
-void publishHealthMessage()
+bool publishHealthMessage(bool init=false)
 {
-  StaticJsonDocument<MAX_MESSAGE_LEN> msg_json;
-  msg_json["uptime"] = getReadableTime(millis());
-  msg_json["mem_freeKB"] = serialized(String((float)ESP.getFreeHeap()/ 1024.0,0));//Ref:https://arduinojson.org/v6/how-to/configure-the-serialization-of-floats/
-  msg_json["msg_count"] = message_count;
-  msg_json["queue_len"] = structQueue.itemCount();
-  float message_rate = (message_count - last_message_count)/(float)(HEALTH_INTERVAL/(60*1000));//rate calculated over one minute
-  last_message_count = message_count;//reset the count
-  msg_json["msg_rate"] = serialized(String(message_rate,1));//format with 1 decimal places, Ref:https://arduinojson.org/v6/how-to/configure-the-serialization-of-floats/
-
   char publish_topic[65] = "";
-  // create a path for this specific device which is of the form MQTT_BASE_TOPIC/<master_id> , master_id is usually the mac address stripped off the colon eg. MQTT_BASE_TOPIC/2CF43220842D
-  strcpy(publish_topic,MQTT_TOPIC);
-  strcat(publish_topic,"/state");
   String str_msg="";
-  serializeJson(msg_json,str_msg);
-  publishToMQTT(str_msg.c_str(),publish_topic,false);
 
-
-  // publish the wifi message , I am publishing this everytime because it also has rssi
-  strIP_address = WiFi.localIP().toString();
-  StaticJsonDocument<MAX_MESSAGE_LEN> wifi_msg_json;//It is recommended to create a new obj than reuse the earlier one by ArduinoJson
-  wifi_msg_json["ip_address"] = strIP_address;
-  wifi_msg_json["rssi"] = WiFi.RSSI();
-  strcpy(publish_topic,MQTT_TOPIC);
-  strcat(publish_topic,"/wifi");
-  str_msg="";
-  serializeJson(wifi_msg_json,str_msg);
-  publishToMQTT(str_msg.c_str(),publish_topic,true);
-
-  //Now publish the init message only if we're starting up
-  if(startup)
+  if(init)
   {
-    // publish the init message
+     // publish the init message
     StaticJsonDocument<MAX_MESSAGE_LEN> init_msg_json;//It is recommended to create a new obj than reuse the earlier one by ArduinoJson
     init_msg_json["version"] = compile_version;
     init_msg_json["tot_memKB"] = (float)ESP.getFlashChipSize() / 1024.0;
     init_msg_json["mac"] = WiFi.macAddress();
     init_msg_json["macAP"] = WiFi.softAPmacAddress();
+    init_msg_json["wifiChannel"] = WiFi.channel();
     strcpy(publish_topic,MQTT_TOPIC);
     strcat(publish_topic,"/init");
     str_msg="";
     serializeJson(init_msg_json,str_msg);
-    publishToMQTT(str_msg.c_str(),publish_topic,true);
+    return publishToMQTT(str_msg.c_str(),publish_topic,true);
   }
+  else
+  {
+    StaticJsonDocument<MAX_MESSAGE_LEN> msg_json;
+    msg_json["uptime"] = millis()/1000; //publish uptime in seconds
+    msg_json["mem_freeKB"] = serialized(String((float)ESP.getFreeHeap()/ 1024.0,0));//Ref:https://arduinojson.org/v6/how-to/configure-the-serialization-of-floats/
+    msg_json["msg_count"] = message_count;
+    msg_json["queue_len"] = structQueue.itemCount();
+    float message_rate = (message_count - last_message_count)/(float)(HEALTH_INTERVAL/(60*1000));//rate calculated over one minute
+    last_message_count = message_count;//reset the count
+    msg_json["msg_rate"] = serialized(String(message_rate,1));//format with 1 decimal places, Ref:https://arduinojson.org/v6/how-to/configure-the-serialization-of-floats/
+
+    // create a path for this specific device which is of the form MQTT_BASE_TOPIC/<master_id> , master_id is usually the mac address stripped off the colon eg. MQTT_BASE_TOPIC/2CF43220842D
+    strcpy(publish_topic,MQTT_TOPIC);
+    strcat(publish_topic,"/state");
+    serializeJson(msg_json,str_msg);
+    if(publishToMQTT(str_msg.c_str(),publish_topic,false))
+    {
+      // publish the wifi message , I am publishing this everytime because it also has rssi
+      strIP_address = WiFi.localIP().toString();
+      StaticJsonDocument<MAX_MESSAGE_LEN> wifi_msg_json;//It is recommended to create a new obj than reuse the earlier one by ArduinoJson
+      wifi_msg_json["ip_address"] = strIP_address;
+      wifi_msg_json["rssi"] = WiFi.RSSI();
+      strcpy(publish_topic,MQTT_TOPIC);
+      strcat(publish_topic,"/wifi");
+      str_msg="";
+      serializeJson(wifi_msg_json,str_msg);
+      return publishToMQTT(str_msg.c_str(),publish_topic,true);
+   }
+  }
+  return false;//control will never come here
+}
+
+void printInitInfo()
+{
+  DPRINTLN("Starting up as a ESPNow Gateway");
+  #if USING(MOTION_SENSOR)
+    DPRINTLN("Motion sensor ON");
+  #else
+    DPRINTLN("Motion sensor OFF");
+  #endif
+  #if USING(SECURITY)
+    DPRINTLN("Security ON");
+  #else
+    DPRINTLN("Security OFF");
+  #endif
 
 }
 
@@ -270,14 +330,41 @@ void publishHealthMessage()
  * Initializes the ESP with espnow and WiFi client , OTA etc
  */
 void setup() {
-  // Initialize Serial Monitor
-  Serial.begin(115200);
+  // Initialize Serial Monitor , if we're usng pin 3 on ESP8266 for PIR then initialize Serial as Tx only , disable Rx
+  #if USING(MOTION_SENSOR)
+  if(PIR_PIN == 3)
+    {DBEGIN(115200, SERIAL_8N1, SERIAL_TX_ONLY);}
+  else
+    {DBEGIN(115200);}
+  #else
+    {DBEGIN(115200);}
+  #endif
+
+  printInitInfo();
+
+  // Set the device as a Station and Soft Access Point simultaneously
+  WiFi.mode(WIFI_AP_STA); // This has to be WIFI_AP_STA and not WIFI_STA, I dont know why but if set to WIFI_STA then it can only receive broadcast messages
+  // and stops receiving MAC specific messages.
+  // Set a custom MAC address for the device. This is helpful in cases where you want to replace the actual ESP device in future
+  // A custom MAC address will allow all sensors to continue working with the new device and you will not be required to update code on all devices
+  uint8_t customMACAddress[] = DEVICE_MAC; // defined in Config.h
+  if(wifi_set_macaddr(SOFTAP_IF, &customMACAddress[0]))
+    { DPRINT("Successfully set a custom MAC address as:");
+      DPRINTLN(WiFi.softAPmacAddress());
+    }
+    else
+    {DPRINT("Failed to set custom MAC address:");}
+
+  pinMode(STATUS_LED,OUTPUT);
   WiFi.config(ESP_IP_ADDRESS, default_gateway, subnet_mask);//from secrets.h
   String device_name = DEVICE_NAME;
   device_name.replace("_","-");//hostname dont allow underscores or spaces
   WiFi.hostname(device_name.c_str());// Set Hostname.
-  // Set the device as a Station and Soft Access Point simultaneously
-  WiFi.mode(WIFI_STA);//WIFI_AP_STA
+
+
+  // For Station Mode
+  //wifi_set_macaddr(STATION_IF, &newMACAddress[0]);
+
   // Set device as a Wi-Fi Station
   WiFi.begin(ssid, password);
   DPRINTLN("Setting as a Wi-Fi Station..");
@@ -301,21 +388,18 @@ void setup() {
     return;
   }
   
-  esp_now_set_self_role(ESP_NOW_ROLE_SLAVE);
-  byte channel = wifi_get_channel();
+  esp_now_set_self_role(MY_ROLE);
   #if USING(SECURITY)
   // Setting the PMK key
-  esp_now_set_kok(kok, 16);
-  #endif
+  esp_now_set_kok(kok, KEY_LEN);
+  byte channel = wifi_get_channel();
+  // Add each controller who is expected to send a message to this gateway
   for(byte i = 0;i< sizeof(controller_mac)/6;i++)
   {
-    #if USING(SECURITY)
-    esp_now_add_peer(controller_mac[i], ESP_NOW_ROLE_CONTROLLER, channel, key, 16);
-    esp_now_set_peer_key(controller_mac[i], key, 16);
-    #else
-    esp_now_add_peer(controller_mac[i], ESP_NOW_ROLE_CONTROLLER, channel, NULL, 16);
-    #endif
+    esp_now_add_peer(controller_mac[i], RECEIVER_ROLE, channel, key, KEY_LEN);
+    DPRINTFLN("Added controller :%02X:%02X:%02X:%02X:%02X:%02X",controller_mac[i][0],controller_mac[i][1],controller_mac[i][2],controller_mac[i][3],controller_mac[i][4],controller_mac[i][5] );
   }
+   #endif
 
   esp_now_register_send_cb(OnDataSent);
   esp_now_register_recv_cb(OnDataRecv);
@@ -331,10 +415,10 @@ void setup() {
     }
 
     // NOTE: if updating FS this would be the place to unmount FS using FS.end()
-    Serial.println("Start updating " + type);
+    DPRINTLN("Start updating " + type);
   });
   ArduinoOTA.onEnd([]() {
-    Serial.println("\nEnd");
+    DPRINTLN("\nEnd");
   });
   ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
     DPRINTF("Progress: %u%%\r", (progress / (total / 100)));
@@ -342,20 +426,26 @@ void setup() {
   ArduinoOTA.onError([](ota_error_t error) {
     DPRINTF("Error[%u]: ", error);
     if (error == OTA_AUTH_ERROR) {
-      Serial.println("Auth Failed");
+      DPRINTLN("Auth Failed");
     } else if (error == OTA_BEGIN_ERROR) {
-      Serial.println("Begin Failed");
+      DPRINTLN("Begin Failed");
     } else if (error == OTA_CONNECT_ERROR) {
-      Serial.println("Connect Failed");
+      DPRINTLN("Connect Failed");
     } else if (error == OTA_RECEIVE_ERROR) {
-      Serial.println("Receive Failed");
+      DPRINTLN("Receive Failed");
     } else if (error == OTA_END_ERROR) {
-      Serial.println("End Failed");
+      DPRINTLN("End Failed");
     }
   });
   ArduinoOTA.begin();
-  publishHealthMessage();
-  startup = false;
+  reconnectMQTT(); //connect to MQTT before publishing the startup message
+  if(publishHealthMessage(true)) //publish the startup message
+    initilised = true;
+  #if USING(MOTION_SENSOR)
+  if(!motion_sensor.begin(MOTION_SENSOR_NAME)) //initialize the motion sensor
+    DPRINTLN("Failed to initialize motion sensor");
+  #endif
+  
 }
 
 
@@ -364,19 +454,27 @@ void setup() {
  */
 void loop() {
   //check for MQTT connection
-
   if (!client.connected()) 
   {
-    long now = millis();
-    if (now - lastReconnectAttempt > MQTT_RETRY_INTERVAL) {
-      lastReconnectAttempt = now;
-      // Attempt to reconnect
-      reconnectMQTT();
-    }
+    reconnectMQTT(); // Attempt to reconnect
   } else {
-    // Client connected
-    client.loop();
+    client.loop(); // Client connected
   }
+  MQTT_wd.update(client.connected()); //feed the watchdog by calling update
+  
+  #if USING(MOTION_SENSOR)
+  short motion_state = motion_sensor.update();
+  if(motion_state == 1)
+  {
+    DPRINTLN("Motion detected as ON");
+    publishMotionMsgToMQTT(motion_sensor.getSensorName(),"on");
+  }
+  else if(motion_state == 2)
+  {
+    DPRINTLN("Motion detected as OFF");
+    publishMotionMsgToMQTT(motion_sensor.getSensorName(),"off");
+  }
+  #endif
 
   ArduinoOTA.handle();
   
@@ -400,11 +498,20 @@ void loop() {
       }//else the same message will be retried the next time
     }
   }
+
   // try to publish health message irrespective of the state of espnow messages
   if(millis() - last_time > HEALTH_INTERVAL)
   {
-    //collect health params and publish the health message
+    // It might be possible when the ESP comes up MQTT is down, in that case an init message will not get published in setup()
+    // The statement below will check and publish the same , only once
+    if(!initilised)
+    {
+      if(publishHealthMessage(true))
+        initilised = true;
+    }
+    //Now publish the health message
     publishHealthMessage();
-    last_time = millis();
+    last_time = millis(); // This is reset irrespective of a successful publish else the main loop will continously try to publish this message
   }
+  statusLED.loop();
 }

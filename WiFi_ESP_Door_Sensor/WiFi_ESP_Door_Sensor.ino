@@ -22,19 +22,12 @@
 */
 #include <PubSubClient.h>
 #include <ESP8266WiFi.h>
-
-// Uncomment one of the below define to compile the program for that device
-#define MAIN_DOOR
-//#define TERRACE_DOOR
-//#define BALCONY_DOOR
-
-//#define TESTING_MODE //used to prevent using Rx & Tx as input pins , rather use them as normal serial pins for debugging , comment this out during normal operation
-#define DEBUG (0) //BEAWARE that this statement should be before #include "Debugutils.h" else the macros wont work as they are based on this #define
-#include "Debugutils.h" //This file is located in the Sketches\libraries\DebugUtils folder
-
-#include "secrets.h" 
+#include "macros.h"
+#include "secrets.h"
 #include "DoorConfig.h"
+#include "Debugutils.h"
 
+// ************ HASH DEFINES *******************
 #define VERSION "2.1.1"
 const char compile_version[] = VERSION " " __DATE__ " " __TIME__; //note, the 3 strings adjacent to each other become pasted together as one long string
 //For some reason I get an error that compile_version is not defined in this scope if I use version.h where the above statement is written, so writing it inline instead.
@@ -45,14 +38,15 @@ const char compile_version[] = VERSION " " __DATE__ " " __TIME__; //note, the 3 
 #define SENSOR_OPEN 2
 #define SENSOR_CLOSED 3
 #define MAX_MQTT_CONNECT_RETRY 4 //max no of retries to connect to MQTT server
-
 #define MSG_ON "on" //payload for ON
 #define MSG_OFF "off"//payload for OFF
+// ************ HASH DEFINES *******************
 
+// ************ GLOBAL OBJECTS/VARIABLES *******************
 ADC_MODE(ADC_VCC);//connects the internal ADC to VCC pin and enables measuring Vcc
-
 WiFiClient espClient;
 PubSubClient client(espClient);
+// ************ GLOBAL OBJECTS/VARIABLES *******************
 
 void setup() 
 {
