@@ -1,16 +1,31 @@
 /*
-Utility file which encapsulates the functionality of initializing espnow on a controller (aka sensor). Has the following features
-* Scans the WiFi channel for the peer using SSID and stores it in EEPROM for later use. This saves ~2 sec when sending messages
-* Retries the sending of a failed message a certain no of times (passed as paramter)
-* Retries refreshing of WiFi channel no if sending fails only once, if its required to scan the channel again, call setChannelRefreshFlag)(false)
-* Initilizes the espnow for espnow functions , sets role etc
-* refreshes the peer, required in case channel changes
-* sends a message via espnow
-* usage : 
-  - instantiate an object of esputil passing in the role & SSID in the constructor
-  - call inilize() and then refreshPeer()
-  - send message via sendMessage() and monitor the result of the message send via the flag bResult
-  - set the flag bResultReady in OnDataSent when a confirmation of the same is received
+Utility file which encapsulates the functionality of initializing espnow on a controller (aka sensor). It has the following features
+* - Single code base works with both ESP8266 and ESP32
+* - Scans the WiFi channel number for the peer using provided SSID and stores it in EEPROM for later use. 
+*  This saves ~2 sec time. The ESP controller is required to be on the same channel as the Slave else messages wont be received
+* - Retries the sending of a failed message a certain no of times (passed as parameter)
+* - Retries refreshing of WiFi channel no, if sending fails only once, if its required to scan the channel again, set channelRefreshed=false
+*   from the calling code
+* - Initilizes the espnow for espnow functions , sets role etc
+* - refreshes the peer. This deletes an existing peer and adds it. This is to be called initially to add a peer
+*   but can be called later too when the channel no changes in between and so the peer needs to be refreshed
+  - Monitors the delivery success of the message subject to a timeout - WAIT_TIMEOUT
+* Usage Steps :
+  - Define the following variables in the calling code : 
+    bool deliverySuccess , bool bResultReady , #define WIFI_SSID
+  - Call EEPROM.begin(size) , to initialize the EEPROM. IT is used to store the channel no for future use
+  - call initilizeESP - to initialize the ESP , aps in the SSID the Slave connects to and the role in case of ESP8266
+    For ESP32 role is ignored
+  - register the OnDatasent & onDatareceive callbacks in the calling code
+  - Call refreshPeer() - passing in ther gateway address of Slave and ROLE of Slave. This concludes the setup process
+  - Call sendESPnowMessage() to send a message of type espnow_message 
+    monitor the delivery success of the message send via the flag deliverySuccess until bResultReady is not set
+
+TO DO list:
+  - refreshPeer() function when called from within sendESPnowMessage needs access to a variable WIFI_SSID in order to rescan the 
+    SSID channel number, I have to remove this and paramterize this later
+  - Security is still not tested fully although code for that is present
+
 
 */
 
@@ -43,7 +58,6 @@ volatile bool bResultReady = false;
 #define WAIT_TIMEOUT 25 // time in millis to wait for acknowledgement of the message sent
 #define CONNECTION_RETRY_INTERVAL 30 // time is secs to wait before refreshing the connection in case of failure
 #define MAX_SSID 50
-#define EEPROM_SIZE 4 // we only need 4 bytes to store int type channel number
 //Define the esp_now_peer_info if we're working with esp8266, for ESP32 its already defined
 #if defined(ESP8266)
 typedef struct esp_now_peer_info {// this is defined in esp_now.h for ESP32 but not in espnow.h for ESP8266
@@ -64,11 +78,11 @@ enum	esp_now_role	{
 };
 #endif
 // ************ HASH DEFINES *******************
-
  
 /*
-* Gets the WiFi channel of the SSID of your router, It has to be on the same channel as this one as the receiver will listen to ESPNow messages on the same 
+* Gets the WiFi channel of the SSID of your router, It has to be on the same channel as what the Slave is on
 * While theritically it should be possible for WiFi and ESPNow to work on different channels but it seems due to some bug (or behavior) this isnt possible with espressif
+* return type : uint8_t
 */
 uint8_t getSSIDChannel(const char *ssid) {
   if (int32_t n = WiFi.scanNetworks()) {
@@ -83,7 +97,7 @@ uint8_t getSSIDChannel(const char *ssid) {
 }
 
 /*
-* Gets the current WiFi channel of the ESP
+* returns the current WiFi channel of the ESP
 * return type : uint8_t
 */
 uint8_t getWiFiChannel()
@@ -102,9 +116,9 @@ uint8_t getWiFiChannel()
 * Sets the right channel for WiFi on the ESP. It finds the channel of the SSID passed to it and then changes the channel of the ESP to match the same
 * It also stores it in the EEPROM memory if different from the one already on for later use
 * While theritically it should be possible for WiFi and ESPNow to work on different channels but it seems due to some bug (or behavior) this isnt possible with espressif
+* paramter- ssid - SSID for which to match the channel
 * parameter- forceChannelRefresh - force the code to scan the SSID channel afresh
 * paramter- restartOnError - restart the ESP if it is not able to set the channel properly (due to some unforeseen error)
-* paramter- ssid - SSID for which to match the channel
 */
 void setSSIDChannel(const char ssid[MAX_SSID], bool forceChannelRefresh = false, bool restartOnError= false)
 {
@@ -173,7 +187,7 @@ void setSSIDChannel(const char ssid[MAX_SSID], bool forceChannelRefresh = false,
 
 /*
 * calls all statements to initialize the esp device for espnow messages
-* It sets STA mode, reads channel from RTC, if invalid, re-scans channel, sets ESP role
+* It sets STA mode, reads channel from EEPROM, if invalid, re-scans channel, sets ESP role
 * param - ssid - SSID for which the channel has to be matched
 * param - esp_now_role - only applicable for ESP8266 - role of the device , NULL for ESP32
 * param - restartOnError - bool , to restart ESP if we we're not able to set the channel properly
@@ -182,7 +196,7 @@ void setSSIDChannel(const char ssid[MAX_SSID], bool forceChannelRefresh = false,
 void initilizeESP(const char ssid[MAX_SSID],esp_now_role role, bool forceChannelRefresh = false, bool restartOnError= false)
 {
   // Set device as a Wi-Fi Station and set channel
-  WiFi.mode(WIFI_STA); // I shifted this to before the call to set the channel, see it it works
+  WiFi.mode(WIFI_STA); 
   setSSIDChannel(ssid,forceChannelRefresh,restartOnError);
   
   // if we're forcing an init again, deinit first
@@ -249,11 +263,11 @@ bool refreshPeer(esp_now_peer_info_t *peer)
 #endif
 
 /*
-* Sends a espnow_message to the slave. It retries to send the message a certain no of times if if fails and then gives up
-* Relies on the variable bResultReady to set true in the call back function of the OnDataSent to determine if the message sending was successful
-* You must set this in the OnDataSent function in your code
+* Sends a espnow_message to the slave. It retries to send the message a certain no of times if it fails and then gives up
+* Relies on the variable bResultReady & deliverySuccess which is set to true in the call back function of the OnDataSent to determine if the
+   message sending was successful. You must set these in the OnDataSent function in your code
 */
-int sendESPnowMessage(espnow_message *myData,uint8_t peerAddress[], short retries=1)
+int sendESPnowMessage(espnow_message *myData,uint8_t peerAddress[], short retries=1,bool ack= true)
 {
   bResultReady = false;
   // retries should at least be 1 so that a message is tried twice in the loop, this is so that if channel number needs refreshed,
@@ -269,28 +283,34 @@ int sendESPnowMessage(espnow_message *myData,uint8_t peerAddress[], short retrie
     if (result == 0) DPRINTLN("Sent message, waiting for delivery...");
     else DPRINTLN("Error sending the message");
     
-    //get a confirmation of successful delivery , else may try again. This flag is set in the callback OnDataSent from the calling code
-    while(!bResultReady && ((millis() - waitTimeStart) < WAIT_TIMEOUT))
+    if(ack)
     {
-      delay(1);
-    }
-    //DPRINTFLN("wait:%u",(millis() - waitTimeStart));
-    if(result == 0  && deliverySuccess == 0)
-    {
-      break;
+      //get a confirmation of successful delivery , else try again. This flag is set in the callback OnDataSent from the calling code
+      while(!bResultReady && ((millis() - waitTimeStart) < WAIT_TIMEOUT))
+      {
+        delay(1);
+      }
+      //DPRINTFLN("wait:%u",(millis() - waitTimeStart));
+      if(result == 0  && deliverySuccess == 0)
+      {
+        break;
+      }
+      else
+      {
+          bResultReady = false; // message sending failed , prepare for next iteration
+          // See if we are on the right channel, it might have changed since last time we wrote the same in EEPROM memory
+          // Do it only once in the cycle to send a message else it consumes battery every time the ESP tries to send in case
+          // there is permanent error in sending a message - eg. in case the Slave isnt available
+          if(!channelRefreshed)
+          {
+              DPRINTLN("Refresh wifi channel...");
+              setSSIDChannel(ssid,true);//force the channel refresh
+              channelRefreshed = true;// this will enable refreshing of channel only once in a cycle, unless the flag is again reset by the calling code
+          }
+      }
     }
     else
-    {
-        bResultReady = false; // message sending failed , prepare for next iteration
-        // //See if we are on the right channel, it might have changed since last time we wrote the same in RTC memory
-        // // Scan for the WiFi channel again and store the new value in the RTC memory, Do it only once
-        if(!channelRefreshed)
-        {
-            DPRINTLN("Refresh wifi channel...");
-            setSSIDChannel(WIFI_SSID,true);//force the channel refresh
-            channelRefreshed = true;// this will enable refreshing of channel only once in a cycle, unless the flag is again reset by the calling code
-        }
-    }
+      return result==0?true:false;
   }
   return deliverySuccess;
 }

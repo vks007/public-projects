@@ -3,6 +3,11 @@
 #define ESPNOW_MESSAGE_H
 #include "myutils.h"
 
+#define OTA_MSG "OTA" // ota message , if received triggers an OTA mode
+typedef enum {
+    ESP_NOW_OTA        = 0
+} msg_type_t;
+
 // Datatypes in Arduino : https://www.tutorialspoint.com/arduino/arduino_data_types.htm
 // ESPNow has a limit of sending 250 bytes MAX and so the struct should not be more than that
 // specifying the __attribute__((packed)) for a struct results in exactly the same bytes as the constituents without any padding
@@ -10,6 +15,7 @@
 typedef struct espnow_message{
   char device_name[16]="";// contains unique device name, falls back to the mac address without colon if device id is not provided
   unsigned long message_id; //unique message id generated for each message
+  msg_type_t msg_type;
   int intvalue1; // int any data
   int intvalue2; // int any data
   int intvalue3; // // int any data
