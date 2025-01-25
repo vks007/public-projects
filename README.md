@@ -1,2 +1,2 @@
 # public-projects
-Contains projects which are publicly available
+Contains projects relating to microcontrollers, home automation and sensors
